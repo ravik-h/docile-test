@@ -10,6 +10,7 @@ Usage:
   python shard_pdfs.py docile/pdfs out/docile --shard-size 25
   python shard_pdfs.py docile/pdfs out/docile --ids docile/val.json    # only the IDs listed
   python shard_pdfs.py docile/pdfs out/docile --annotations docile/annotations
+  python shard_pdfs.py docile/pdfs out/docile --exclude-scanned   # skip image-only / OCR'd scans
 
 Output:
   out/docile/0000/<file>.pdf ... 0001/ ...      <- PDFs only, nothing else in the tree
@@ -19,6 +20,13 @@ Output:
 
 Files are sorted by name before sharding so the layout is reproducible.
 
+Scan detection (needs `pip install pdfplumber`): a page counts as scanned when
+it yields almost no extractable text, or when a single image covers most of the
+page (an OCR'd scan: picture underneath, invisible text on top). A document is
+"scanned" if its first page is; the verdict and the raw numbers go into the
+manifest as `scanned`, `text_chars`, `image_coverage`. --exclude-scanned leaves
+those documents where they are and lists them in <dst>_excluded.txt.
+
 --link moves each PDF into its shard and replaces the original with a relative
 symlink pointing at the new location, so tools that expect the original flat
 folder (e.g. the docile library) keep working while each PDF exists only once.
@@ -26,6 +34,8 @@ On Windows, symlinks need Developer Mode or admin rights; if creating one fails
 the script falls back to a hard link (same volume only) and says so. Re-running
 with --link is safe: existing links are left alone.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -85,6 +95,42 @@ def read_metadata(annotations_dir: Path | None, docid: str) -> dict:
     }
 
 
+def scan_check(pdf_path: Path, min_text_chars: int, max_image_coverage: float) -> dict:
+    """Look at page 1 and decide whether the PDF is a scan.
+
+    Returns {"scanned": bool|None, "text_chars": int, "image_coverage": float, "scan_reason": str}.
+    scanned is None if the file could not be opened.
+    """
+    try:
+        import pdfplumber  # imported lazily so the script runs without it if the flag isn't used
+    except ImportError:
+        sys.exit("scan detection needs pdfplumber: pip install pdfplumber")
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if not pdf.pages:
+                return {"scanned": None, "text_chars": 0, "image_coverage": 0.0, "scan_reason": "no pages"}
+            page = pdf.pages[0]
+            text_chars = len((page.extract_text() or "").strip())
+            page_area = float(page.width) * float(page.height) or 1.0
+            # largest single image as a fraction of the page
+            coverage = 0.0
+            for im in page.images:
+                w = max(0.0, float(im["x1"]) - float(im["x0"]))
+                h = max(0.0, float(im["bottom"]) - float(im["top"]))
+                coverage = max(coverage, (w * h) / page_area)
+            coverage = min(coverage, 1.0)
+    except Exception as exc:
+        return {"scanned": None, "text_chars": 0, "image_coverage": 0.0, "scan_reason": f"unreadable: {exc}"}
+
+    if text_chars < min_text_chars:
+        return {"scanned": True, "text_chars": text_chars, "image_coverage": round(coverage, 3),
+                "scan_reason": "no text layer"}
+    if coverage > max_image_coverage:
+        return {"scanned": True, "text_chars": text_chars, "image_coverage": round(coverage, 3),
+                "scan_reason": "full-page image with text layer (OCR'd scan)"}
+    return {"scanned": False, "text_chars": text_chars, "image_coverage": round(coverage, 3), "scan_reason": ""}
+
+
 def leave_link(original: Path, target: Path) -> bool:
     """Create original -> target as a relative symlink; fall back to a hard link.
     Returns True if the hard-link fallback was used."""
@@ -113,6 +159,12 @@ def main() -> None:
     ap.add_argument("--annotations", type=Path, default=None, help="DocILE annotations dir, to enrich the manifest")
     ap.add_argument("--ext", default=".pdf", help="file extension to include (default .pdf)")
     ap.add_argument("--no-manifest", action="store_true", help="don't write a manifest at all")
+    ap.add_argument("--exclude-scanned", action="store_true",
+                    help="skip PDFs that look like scans (image-only or OCR'd image)")
+    ap.add_argument("--min-text-chars", type=int, default=40,
+                    help="fewer extractable chars than this on page 1 => scanned (default 40)")
+    ap.add_argument("--max-image-coverage", type=float, default=0.7,
+                    help="a page-1 image covering more than this fraction => scanned (default 0.7)")
     args = ap.parse_args()
 
     if not args.src.is_dir():
@@ -129,6 +181,24 @@ def main() -> None:
             print(f"warning: {len(missing)} IDs in {args.ids.name} have no {args.ext} in {args.src}", file=sys.stderr)
     if not files:
         sys.exit(f"no {args.ext} files found in {args.src}")
+
+    scan_info: dict[Path, dict] = {}
+    if args.exclude_scanned:
+        print(f"checking {len(files)} PDFs for scans...", file=sys.stderr)
+        kept, excluded = [], []
+        for k, p in enumerate(files):
+            info = scan_check(p.resolve() if p.is_symlink() else p, args.min_text_chars, args.max_image_coverage)
+            scan_info[p] = info
+            (excluded if info["scanned"] else kept).append(p)  # unreadable (None) is kept, flagged in manifest
+            if (k + 1) % 500 == 0:
+                print(f"  {k + 1}/{len(files)} checked, {len(excluded)} scanned so far", file=sys.stderr)
+        excl_path = args.dst.parent / f"{args.dst.name}_excluded.txt"
+        excl_path.parent.mkdir(parents=True, exist_ok=True)
+        excl_path.write_text("".join(f"{p.name}\t{scan_info[p]['scan_reason']}\n" for p in excluded), encoding="utf-8")
+        print(f"excluded {len(excluded)} scanned PDFs (listed in {excl_path}); sharding {len(kept)}", file=sys.stderr)
+        files = kept
+        if not files:
+            sys.exit("nothing left to shard after excluding scans")
 
     args.dst.mkdir(parents=True, exist_ok=True)
     transfer = shutil.move if (args.move or args.link) else shutil.copy2
@@ -157,6 +227,7 @@ def main() -> None:
                 "file": src.name,
                 "bytes": size,
                 **read_metadata(args.annotations, src.stem),
+                **(scan_info.get(src) or {}),
             }
             manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
             if (i + 1) % 1000 == 0:
